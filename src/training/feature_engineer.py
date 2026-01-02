@@ -63,14 +63,39 @@ class FeatureEngineer:
 
     def _ensure_timestamp(self, data: pd.DataFrame) -> pd.DataFrame:
         df = data.copy()
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        elif "Date" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-        elif "date" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-        else:
-            raise ValueError("Expected a 'timestamp', 'Date', or 'date' column for sentiment merge.")
+
+        def _coerce_timestamp(frame: pd.DataFrame) -> pd.DataFrame:
+            frame = frame.copy()
+            if "timestamp" in frame.columns:
+                frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
+                return frame
+            if "Date" in frame.columns:
+                frame["timestamp"] = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+                return frame
+            if "Datetime" in frame.columns:
+                frame["timestamp"] = pd.to_datetime(frame["Datetime"], errors="coerce", utc=True)
+                return frame
+            if "date" in frame.columns:
+                frame["timestamp"] = pd.to_datetime(frame["date"], errors="coerce", utc=True)
+                return frame
+            if "datetime" in frame.columns:
+                frame["timestamp"] = pd.to_datetime(frame["datetime"], errors="coerce", utc=True)
+                return frame
+            if isinstance(frame.index, pd.DatetimeIndex):
+                frame["timestamp"] = pd.to_datetime(frame.index, errors="coerce", utc=True)
+                return frame
+            if frame.index.name and frame.index.name.lower() in {"date", "datetime", "timestamp", "time"}:
+                frame["timestamp"] = pd.to_datetime(frame.index, errors="coerce", utc=True)
+                return frame
+            return frame
+
+        df = _coerce_timestamp(df)
+        if "timestamp" not in df.columns:
+            df = df.reset_index()
+            df = _coerce_timestamp(df)
+
+        if "timestamp" not in df.columns:
+            raise ValueError("Expected a 'timestamp' or date column for sentiment merge.")
 
         return df.dropna(subset=["timestamp"])
 

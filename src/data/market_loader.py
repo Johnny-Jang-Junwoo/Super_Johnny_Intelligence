@@ -91,6 +91,8 @@ def fetch_market_data(
         raise ValueError(f"No market data returned for {ticker} with interval {interval}")
 
     data = data.reset_index()
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [col[0] if isinstance(col, tuple) else col for col in data.columns]
     data.rename(columns={"Datetime": "Date", "Adj Close": "Adj_Close"}, inplace=True)
     return data
 
