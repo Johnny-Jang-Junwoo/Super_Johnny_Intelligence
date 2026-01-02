@@ -5,3 +5,5 @@ joblib
 ollama
 feedparser
 ta
+streamlit
+plotly

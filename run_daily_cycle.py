@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
 
 from analysis import news_processor
 from data import market_loader, news_fetcher
-from training import ai_model
+from training import ai_model, feature_engineer
 
 
 def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -60,16 +60,83 @@ def _mood_label(score: float) -> str:
         return "Bullish"
     return "Neutral"
 
+def _recommendation_from_pred(prediction: float | None) -> str:
+    if prediction is None:
+        return "HOLD"
+    if prediction > 0.002:
+        return "BUY"
+    if prediction < -0.002:
+        return "SELL"
+    return "HOLD"
 
-def _signal_label(signal: int) -> str:
-    return {1: "BUY", -1: "SELL", 0: "HOLD"}.get(signal, "HOLD")
+
+def _format_move(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value * 100:.2f}%"
+
+
+def _sentiment_alignment(features_df: pd.DataFrame) -> tuple[int, str, float | None, float | None]:
+    if features_df.empty:
+        return 50, "Unknown", None, None
+
+    short_windows = ["1h", "1d"]
+    long_windows = ["1w", "1m"]
+    short_cols = [
+        f"sent_{region.lower()}_{window}"
+        for region in feature_engineer.REGIONS
+        for window in short_windows
+    ]
+    long_cols = [
+        f"sent_{region.lower()}_{window}"
+        for region in feature_engineer.REGIONS
+        for window in long_windows
+    ]
+
+    latest = features_df.iloc[-1]
+    short_vals = [
+        float(latest[col])
+        for col in short_cols
+        if col in features_df.columns and pd.notna(latest[col])
+    ]
+    long_vals = [
+        float(latest[col])
+        for col in long_cols
+        if col in features_df.columns and pd.notna(latest[col])
+    ]
+
+    if not short_vals or not long_vals:
+        return 50, "Unknown", None, None
+
+    short_mean = float(pd.Series(short_vals).mean())
+    long_mean = float(pd.Series(long_vals).mean())
+
+    if short_mean * long_mean < 0:
+        return 25, "Low Conviction", short_mean, long_mean
+
+    diff = abs(short_mean - long_mean)
+    score = int(round(70 + 30 * (1 - min(1.0, diff))))
+    return score, "Aligned", short_mean, long_mean
+
+
+def _load_predictions_from_models(
+    model_dir: Path,
+    features_df: pd.DataFrame,
+) -> dict[str, float]:
+    predictions: dict[str, float] = {}
+    for horizon in ai_model.TARGET_COLUMNS:
+        model_path = model_dir / f"model_next_{horizon}.pkl"
+        if not model_path.exists():
+            continue
+        model = ai_model.load_model(model_path)
+        predictions[horizon] = ai_model.predict_latest(model, features_df)
+    return predictions
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the daily trading cycle.")
-    parser.add_argument("--ticker", help="Ticker symbol for market data.")
+    parser.add_argument("--ticker", default="SPY", help="Ticker symbol for market data.")
     parser.add_argument("--drive-path", default=str(market_loader.DRIVE_ROOT))
-    parser.add_argument("--trade-pattern", default=market_loader.TRADE_PATTERN)
     parser.add_argument("--interval", default="1d", choices=["1d"])
     parser.add_argument("--model-dir", default=str(market_loader.DRIVE_ROOT / "models"))
     args = parser.parse_args()
@@ -101,51 +168,55 @@ def main() -> None:
         sentiment_score, sector = 0.0, "unknown"
     sentiment_file = processed_path if sentiment_ok and processed_path.exists() else None
 
-    trade_df, trade_path = market_loader.load_latest_trade_log(drive_root, pattern=args.trade_pattern)
-    trade_df = market_loader.normalize_trade_log(trade_df)
+    ticker = args.ticker or "SPY"
+    price_df = market_loader.fetch_market_data(ticker, interval=args.interval)
 
-    ticker = args.ticker or market_loader.infer_ticker(trade_df)
-    if not ticker:
-        raise ValueError("Ticker not provided and not found in trade logs")
+    features_df = ai_model.build_features(
+        price_df=price_df,
+        sentiment_file=sentiment_file,
+        default_sentiment=0.0,
+    )
 
-    trade_dates = trade_df["Date"].dropna()
-    start = trade_dates.min() if not trade_dates.empty else None
-    end = trade_dates.max() + pd.Timedelta(days=1) if not trade_dates.empty else None
-
-    price_df = market_loader.fetch_market_data(ticker, start=start, end=end, interval=args.interval)
-
+    predictions: dict[str, float] = {}
+    reports: dict[str, ai_model.TrainingReport] = {}
     try:
-        model, model_path, signal = ai_model.train_and_predict(
-            trade_df=trade_df,
+        predictions, reports, _training_df = ai_model.train_and_predict(
             price_df=price_df,
             sentiment_file=sentiment_file,
             default_sentiment=0.0,
             model_dir=model_dir,
         )
-        print(f"Model trained: {model_path}")
-        print(f"Using trade log: {trade_path}")
+        for report in reports.values():
+            print(f"Model trained ({report.horizon}): {report.model_path} (MAE {report.mae:.4f})")
     except Exception as exc:
-        print(f"Training failed ({exc}); attempting to load latest model.")
+        print(f"Training failed ({exc}); attempting to load latest models.")
         try:
-            model_path = ai_model.find_latest_model(model_dir)
-            model = ai_model.load_model(model_path)
-            features_df = ai_model.build_features(
-                price_df=price_df,
-                sentiment_file=sentiment_file,
-                default_sentiment=0.0,
-            )
-            signal = ai_model.predict_latest(model, features_df)
-            print(f"Loaded model: {model_path}")
+            predictions = _load_predictions_from_models(model_dir, features_df)
+            if predictions:
+                print(f"Loaded models from: {model_dir}")
         except Exception as inner_exc:
             print(f"Fallback model load failed ({inner_exc}); defaulting to HOLD.")
-            signal = 0
+            predictions = {}
 
     mood = _mood_label(sentiment_score)
-    recommendation = _signal_label(signal)
+    pred_1d = predictions.get("1d")
+    pred_1w = predictions.get("1w")
+    pred_1m = predictions.get("1m")
+    recommendation = _recommendation_from_pred(pred_1d)
 
-    summary = f"Market Mood: {mood} ({sentiment_score:.2f}). AI Recommendation: {recommendation}."
+    alignment_score, alignment_label, short_mean, long_mean = _sentiment_alignment(features_df)
+
+    summary = (
+        f"Market Mood: {mood} ({sentiment_score:.2f}). "
+        f"AI Recommendation: {recommendation}. "
+        f"Predicted Movement: 1d {_format_move(pred_1d)}, "
+        f"1w {_format_move(pred_1w)}, 1m {_format_move(pred_1m)}. "
+        f"Strategy Alignment: {alignment_label} ({alignment_score}/100)."
+    )
     if sector:
         summary += f" Sector: {sector}."
+    if short_mean is not None and long_mean is not None:
+        summary += f" Short Sent: {short_mean:.2f}, Long Sent: {long_mean:.2f}."
     print(summary)
 
 

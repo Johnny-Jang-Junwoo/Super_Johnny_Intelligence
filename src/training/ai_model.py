@@ -1,85 +1,68 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import joblib
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from . import feature_engineer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models"
 
-FEATURE_COLUMNS = ["ema", "rsi", "sentiment_score"]
-DATE_COLUMNS = ["date", "datetime", "timestamp", "time"]
-LABEL_COLUMNS = ["signal", "action", "side", "trade_action", "position"]
-
-SIGNAL_MAP = {
-    "buy": 1,
-    "long": 1,
-    "sell": -1,
-    "short": -1,
-    "hold": 0,
-    "flat": 0,
+HORIZON_PERIODS = {
+    "1d": 1,
+    "1w": 5,
+    "1m": 21,
+}
+TARGET_COLUMNS = {
+    "1d": "target_next_1d_change",
+    "1w": "target_next_1w_change",
+    "1m": "target_next_1m_change",
 }
 
 
-def _find_column(columns: list[str], candidates: list[str]) -> str | None:
-    lower_map = {col.lower(): col for col in columns}
-    for candidate in candidates:
-        if candidate in lower_map:
-            return lower_map[candidate]
-    return None
+@dataclass
+class TrainingReport:
+    horizon: str
+    mae: float
+    feature_importance: pd.DataFrame
+    model_path: Path
 
 
-def normalize_trade_log(trade_df: pd.DataFrame) -> pd.DataFrame:
-    date_col = _find_column(trade_df.columns.tolist(), DATE_COLUMNS)
-    if date_col is None:
-        raise ValueError("Trade log must include a date column")
+def _ensure_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+    if "timestamp" not in data.columns:
+        if "Date" in data.columns:
+            data["timestamp"] = pd.to_datetime(data["Date"], errors="coerce", utc=True)
+        elif "date" in data.columns:
+            data["timestamp"] = pd.to_datetime(data["date"], errors="coerce", utc=True)
+        else:
+            raise ValueError("Price data must include a timestamp or Date column.")
+    else:
+        data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce", utc=True)
 
-    df = trade_df.copy()
-    if date_col != "Date":
-        df = df.rename(columns={date_col: "Date"})
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    return df.dropna(subset=["Date"])
-
-
-def _map_signal(value) -> int | None:
-    if value is None or pd.isna(value):
-        return None
-
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in SIGNAL_MAP:
-            return SIGNAL_MAP[text]
-        try:
-            numeric = float(text)
-        except ValueError:
-            return None
-        return int(numeric) if numeric in (-1, 0, 1) else None
-
-    if isinstance(value, (int, float)) and value in (-1, 0, 1):
-        return int(value)
-
-    return None
+    return data.dropna(subset=["timestamp"])
 
 
-def _extract_labels(trade_df: pd.DataFrame) -> pd.DataFrame:
-    label_col = _find_column(trade_df.columns.tolist(), LABEL_COLUMNS)
-    if label_col is None:
-        raise ValueError("Trade log must include a signal/action column for behavioral cloning")
+def _get_feature_columns() -> list[str]:
+    sentiment_cols = feature_engineer.get_sentiment_feature_columns()
+    return ["ema", "rsi"] + sentiment_cols
 
-    labels = trade_df[["Date", label_col]].copy()
-    labels["signal"] = labels[label_col].apply(_map_signal)
-    labels = labels.dropna(subset=["signal"])
 
-    if labels.empty:
-        raise ValueError("No valid trade signals found in trade log")
+def add_targets(data: pd.DataFrame) -> pd.DataFrame:
+    df = data.copy()
+    close = df["close"] if "close" in df.columns else df["Close"]
 
-    labels["signal"] = labels["signal"].astype(int)
-    return labels[["Date", "signal"]]
+    for horizon, periods in HORIZON_PERIODS.items():
+        target_col = TARGET_COLUMNS[horizon]
+        df[target_col] = (close.shift(-periods) / close) - 1
+
+    return df
 
 
 def build_features(
@@ -87,99 +70,235 @@ def build_features(
     sentiment_file: Path | str | None = None,
     default_sentiment: float = 0.0,
 ) -> pd.DataFrame:
-    return feature_engineer.engineer_features(
+    features_df = feature_engineer.engineer_features(
         price_df=price_df,
         sentiment_file=sentiment_file,
         default_sentiment=default_sentiment,
     )
+    return _ensure_timestamp(features_df)
 
 
-def prepare_training_data(
+def prepare_training_frame(
     price_df: pd.DataFrame,
-    trade_df: pd.DataFrame,
     sentiment_file: Path | str | None = None,
     default_sentiment: float = 0.0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     features_df = build_features(price_df, sentiment_file, default_sentiment=default_sentiment)
-    features_df["Date"] = pd.to_datetime(features_df["Date"], errors="coerce")
-    features_df = features_df.dropna(subset=["Date"])
+    features_df = add_targets(features_df)
 
-    normalized_trades = normalize_trade_log(trade_df)
-    labels_df = _extract_labels(normalized_trades)
-    labels_df["Date"] = pd.to_datetime(labels_df["Date"], errors="coerce")
-    labels_df = labels_df.dropna(subset=["Date"])
+    feature_cols = _get_feature_columns()
+    targets = list(TARGET_COLUMNS.values())
+    features_df = features_df.dropna(subset=feature_cols + targets)
 
-    features_df["date_only"] = features_df["Date"].dt.date
-    labels_df["date_only"] = labels_df["Date"].dt.date
-    labels_daily = labels_df.groupby("date_only", as_index=False).last()
+    if features_df.empty:
+        raise ValueError("No training rows available after feature and target preparation")
 
-    training_df = features_df.merge(labels_daily[["date_only", "signal"]], on="date_only", how="left")
-    training_df = training_df.drop(columns=["date_only"]).dropna(subset=["signal"])
-
-    training_df = training_df.dropna(subset=FEATURE_COLUMNS + ["signal"])
-    if training_df.empty:
-        raise ValueError("No training rows after merging trade signals with features")
-
-    return training_df, features_df
+    return features_df
 
 
-def train_model(
-    training_df: pd.DataFrame,
+def walk_forward_train(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    train_months: int = 6,
+) -> tuple[float, pd.Series]:
+    data = df.sort_values("timestamp").copy()
+    data["month"] = data["timestamp"].dt.to_period("M")
+    months = sorted(data["month"].unique())
+
+    if len(months) <= train_months:
+        raise ValueError("Not enough history for walk-forward training")
+
+    maes: list[float] = []
+    importances: list[pd.Series] = []
+
+    for idx in range(train_months, len(months)):
+        train_month_set = months[idx - train_months : idx]
+        test_month = months[idx]
+
+        train_df = data[data["month"].isin(train_month_set)]
+        test_df = data[data["month"] == test_month]
+
+        if train_df.empty or test_df.empty:
+            continue
+
+        model = RandomForestRegressor(
+            n_estimators=300,
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(train_df[feature_cols], train_df[target_col])
+
+        preds = model.predict(test_df[feature_cols])
+        maes.append(mean_absolute_error(test_df[target_col], preds))
+        importances.append(pd.Series(model.feature_importances_, index=feature_cols))
+
+    if not maes:
+        raise ValueError("Walk-forward training produced no evaluation windows")
+
+    avg_mae = float(sum(maes) / len(maes))
+    avg_importance = pd.concat(importances, axis=1).mean(axis=1).sort_values(ascending=False)
+    return avg_mae, avg_importance
+
+
+def train_regressor(
+    df: pd.DataFrame,
+    horizon: str,
     model_dir: Path | None = None,
-) -> tuple[RandomForestClassifier, Path]:
+) -> TrainingReport:
     model_dir = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
     model_dir.mkdir(parents=True, exist_ok=True)
-    model_path = model_dir / "model.pkl"
 
-    X = training_df[FEATURE_COLUMNS]
-    y = training_df["signal"].astype(int)
+    feature_cols = _get_feature_columns()
+    target_col = TARGET_COLUMNS[horizon]
 
-    model = RandomForestClassifier(
-        n_estimators=200,
+    mae, importance = walk_forward_train(df, feature_cols, target_col)
+
+    model = RandomForestRegressor(
+        n_estimators=400,
         random_state=42,
-        class_weight="balanced",
         n_jobs=-1,
     )
-    model.fit(X, y)
+    model.fit(df[feature_cols], df[target_col])
 
+    model_path = model_dir / f"model_next_{horizon}.pkl"
     joblib.dump(model, model_path)
-    return model, model_path
+
+    importance_df = importance.reset_index()
+    importance_df.columns = ["feature", "importance"]
+
+    return TrainingReport(
+        horizon=horizon,
+        mae=mae,
+        feature_importance=importance_df,
+        model_path=model_path,
+    )
 
 
-def predict_latest(model: RandomForestClassifier, features_df: pd.DataFrame) -> int:
-    valid = features_df.dropna(subset=FEATURE_COLUMNS)
-    if valid.empty:
-        raise ValueError("No valid feature rows available for prediction")
-
-    latest = valid.iloc[[-1]][FEATURE_COLUMNS]
-    return int(model.predict(latest)[0])
+def predict_latest(model: RandomForestRegressor, df: pd.DataFrame) -> float:
+    feature_cols = _get_feature_columns()
+    latest = df.dropna(subset=feature_cols).iloc[[-1]][feature_cols]
+    return float(model.predict(latest)[0])
 
 
 def train_and_predict(
-    trade_df: pd.DataFrame,
     price_df: pd.DataFrame,
     sentiment_file: Path | str | None = None,
     default_sentiment: float = 0.0,
     model_dir: Path | None = None,
-) -> tuple[RandomForestClassifier, Path, int]:
-    training_df, features_df = prepare_training_data(
+) -> tuple[dict[str, float], dict[str, TrainingReport], pd.DataFrame]:
+    training_df = prepare_training_frame(
         price_df=price_df,
-        trade_df=trade_df,
         sentiment_file=sentiment_file,
         default_sentiment=default_sentiment,
     )
-    model, model_path = train_model(training_df, model_dir=model_dir)
-    signal = predict_latest(model, features_df)
-    return model, model_path, signal
+
+    predictions: dict[str, float] = {}
+    reports: dict[str, TrainingReport] = {}
+
+    for horizon in TARGET_COLUMNS:
+        report = train_regressor(training_df, horizon, model_dir=model_dir)
+        model = joblib.load(report.model_path)
+        predictions[horizon] = predict_latest(model, training_df)
+        reports[horizon] = report
+
+    save_feature_importance_report(reports.values(), model_dir)
+
+    return predictions, reports, training_df
+
+
+def daily_walk_forward_train(
+    price_df: pd.DataFrame,
+    sentiment_file: Path | str | None = None,
+    default_sentiment: float = 0.0,
+    model_dir: Path | None = None,
+    min_train_days: int = 60,
+    n_estimators: int = 200,
+) -> pd.DataFrame:
+    features_df = build_features(
+        price_df=price_df,
+        sentiment_file=sentiment_file,
+        default_sentiment=default_sentiment,
+    )
+    features_df = add_targets(features_df)
+    features_df = _ensure_timestamp(features_df)
+
+    feature_cols = _get_feature_columns()
+    features_df = features_df.dropna(subset=feature_cols)
+    features_df = features_df.sort_values("timestamp").reset_index(drop=True)
+
+    report_rows: list[dict[str, float | str]] = []
+
+    for idx in range(min_train_days, len(features_df)):
+        train_df = features_df.iloc[:idx]
+        test_row = features_df.iloc[idx]
+        date_str = test_row["timestamp"].date().isoformat()
+
+        row_result: dict[str, float | str] = {"date": date_str}
+
+        for horizon, target_col in TARGET_COLUMNS.items():
+            train_subset = train_df.dropna(subset=[target_col])
+            actual = test_row.get(target_col)
+
+            if train_subset.empty or pd.isna(actual):
+                row_result[f"predicted_{horizon}_change"] = float("nan")
+                row_result[f"actual_{horizon}_change"] = float("nan")
+                row_result[f"mse_{horizon}"] = float("nan")
+                continue
+
+            model = RandomForestRegressor(
+                n_estimators=n_estimators,
+                random_state=42,
+                n_jobs=-1,
+            )
+            model.fit(train_subset[feature_cols], train_subset[target_col])
+
+            test_features = test_row[feature_cols].to_frame().T
+            prediction = float(model.predict(test_features)[0])
+            actual_value = float(actual)
+            mse_value = mean_squared_error([actual_value], [prediction])
+
+            row_result[f"predicted_{horizon}_change"] = prediction
+            row_result[f"actual_{horizon}_change"] = actual_value
+            row_result[f"mse_{horizon}"] = mse_value
+
+        report_rows.append(row_result)
+
+    report_df = pd.DataFrame(report_rows)
+    if model_dir is not None:
+        model_dir = Path(model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        report_df.to_csv(model_dir / "daily_backtest_report.csv", index=False)
+
+    return report_df
+
+
+def save_feature_importance_report(reports: Iterable[TrainingReport], model_dir: Path | None) -> None:
+    model_dir = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
+    rows = []
+    for report in reports:
+        for _, row in report.feature_importance.iterrows():
+            rows.append(
+                {
+                    "horizon": report.horizon,
+                    "feature": row["feature"],
+                    "importance": row["importance"],
+                    "mae": report.mae,
+                }
+            )
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(model_dir / "feature_importance.csv", index=False)
 
 
 def find_latest_model(model_dir: Path | None = None) -> Path:
     model_dir = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
-    models = list(model_dir.glob("*.pkl"))
+    models = list(model_dir.glob("model_next_*.pkl"))
     if not models:
         raise FileNotFoundError(f"No .pkl models found in {model_dir}")
     return max(models, key=lambda p: p.stat().st_mtime)
 
 
-def load_model(model_path: Path) -> RandomForestClassifier:
+def load_model(model_path: Path) -> RandomForestRegressor:
     return joblib.load(Path(model_path))

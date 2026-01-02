@@ -100,13 +100,27 @@ def process_news(drive_root: Path = DRIVE_ROOT, model: str = "llama3.1") -> int:
     raw_df = pd.read_csv(raw_path)
     headline_col = _find_column(raw_df, ["headline", "title", "news", "text"])
     timestamp_col = _find_column(raw_df, ["timestamp", "published", "date", "datetime"])
+    region_col = _find_column(raw_df, ["region"])
 
     if headline_col is None:
         raise ValueError("raw_news.csv must include a headline column")
 
+    desired_columns = [
+        "timestamp",
+        "headline",
+        "link",
+        "source",
+        "region",
+        "sentiment",
+        "impact",
+        "sector",
+        "reasoning",
+    ]
     existing_keys: set[str] = set()
+    existing_columns = desired_columns
     if processed_path.exists():
         processed_df = pd.read_csv(processed_path)
+        existing_columns = list(processed_df.columns)
         for _, row in processed_df.iterrows():
             headline = row.get("headline", "")
             link = row.get("link", "")
@@ -115,6 +129,13 @@ def process_news(drive_root: Path = DRIVE_ROOT, model: str = "llama3.1") -> int:
             key = _dedupe_key(headline, link)
             if key:
                 existing_keys.add(key)
+        if set(desired_columns) - set(existing_columns):
+            for column in desired_columns:
+                if column not in processed_df.columns:
+                    processed_df[column] = ""
+            processed_df = processed_df[desired_columns]
+            processed_df.to_csv(processed_path, index=False)
+            existing_columns = desired_columns
 
     processed_path.parent.mkdir(parents=True, exist_ok=True)
     new_keys: set[str] = set()
@@ -134,7 +155,13 @@ def process_news(drive_root: Path = DRIVE_ROOT, model: str = "llama3.1") -> int:
         source = row.get("source", "") if "source" in raw_df.columns else ""
         link = "" if pd.isna(link) else str(link).strip()
         source = "" if pd.isna(source) else str(source).strip()
-        timestamp = row.get(timestamp_col) if timestamp_col else None
+        raw_timestamp = row.get(timestamp_col) if timestamp_col else None
+        parsed_ts = pd.to_datetime(raw_timestamp, errors="coerce", utc=True)
+        if pd.isna(parsed_ts):
+            parsed_ts = pd.Timestamp.utcnow()
+        timestamp = parsed_ts.isoformat()
+        region = row.get(region_col, "US") if region_col else "US"
+        region = "" if pd.isna(region) else str(region).strip() or "US"
 
         key = _dedupe_key(headline, link)
         if not key or key in existing_keys or key in new_keys:
@@ -151,6 +178,7 @@ def process_news(drive_root: Path = DRIVE_ROOT, model: str = "llama3.1") -> int:
                     "headline": headline,
                     "link": link,
                     "source": source,
+                    "region": region,
                     "sentiment": score_data.get("sentiment", 0.0),
                     "impact": score_data.get("impact", 0),
                     "sector": score_data.get("sector", "Unknown"),
@@ -160,6 +188,7 @@ def process_news(drive_root: Path = DRIVE_ROOT, model: str = "llama3.1") -> int:
         )
 
         file_exists = processed_path.exists()
+        new_row = new_row.reindex(columns=existing_columns, fill_value="")
         new_row.to_csv(processed_path, mode="a", index=False, header=not file_exists)
         new_keys.add(key)
         processed_count += 1

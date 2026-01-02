@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import json
+from datetime import timedelta
 from pathlib import Path
 
+import feedparser
 import ollama
 import pandas as pd
 
@@ -46,6 +49,27 @@ def _pick_column(df: pd.DataFrame, candidates: list[str]) -> str:
     return df.columns[0]
 
 
+def _dedupe_key(headline: str, link: str) -> str:
+    key = link or headline
+    return key.strip().lower()
+
+
+def _parse_timestamp(entry) -> str:
+    raw = entry.get("published") or entry.get("updated")
+    if raw:
+        parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.isoformat()
+    parsed_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+    if parsed_struct:
+        try:
+            dt = pd.Timestamp(*parsed_struct[:6], tz="UTC")
+            return dt.isoformat()
+        except Exception:
+            pass
+    return pd.Timestamp.utcnow().isoformat()
+
+
 def analyze_headline(headline: str, model: str = "llama3.1") -> dict:
     prompt = PROMPT_TEMPLATE.format(headline=headline)
     content = ""
@@ -78,6 +102,87 @@ def analyze_headline(headline: str, model: str = "llama3.1") -> dict:
             "sector": "Error",
             "reasoning": f"Parse Fail: {str(exc)[:50]}",
         }
+
+
+def backfill_ticker_news(ticker: str, days: int = 365) -> int:
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise ValueError("Ticker symbol is required for backfill mode.")
+
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=days)
+    existing_keys: set[str] = set()
+    existing_columns = ["timestamp", "category", "region", "headline", "link", "source"]
+
+    if RAW_NEWS_FILE.exists():
+        existing_df = pd.read_csv(RAW_NEWS_FILE)
+        existing_columns = list(existing_df.columns)
+        headline_col = "headline" if "headline" in existing_df.columns else _pick_column(existing_df, ["headline"])
+        link_col = "link" if "link" in existing_df.columns else _pick_column(existing_df, ["link"])
+        for _, row in existing_df.iterrows():
+            headline = row.get(headline_col, "")
+            link = row.get(link_col, "")
+            headline = "" if pd.isna(headline) else str(headline).strip()
+            link = "" if pd.isna(link) else str(link).strip()
+            key = _dedupe_key(headline, link)
+            if key:
+                existing_keys.add(key)
+
+    query = f"{ticker} stock when:{days}d"
+    feed_urls = [
+        f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+    ]
+
+    new_rows = []
+    for url in feed_urls:
+        feed = feedparser.parse(url)
+        source = feed.feed.get("title", "Google News")
+        for entry in feed.entries:
+            headline = str(entry.get("title", "")).strip()
+            if not headline:
+                continue
+            link = str(entry.get("link", "")).strip()
+            key = _dedupe_key(headline, link)
+            if not key or key in existing_keys:
+                continue
+
+            timestamp = _parse_timestamp(entry)
+            parsed_ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
+            if pd.isna(parsed_ts) or parsed_ts < cutoff:
+                continue
+
+            new_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "category": "TICKER_BACKFILL",
+                    "region": "TICKER",
+                    "headline": headline,
+                    "link": link,
+                    "source": str(source),
+                }
+            )
+            existing_keys.add(key)
+
+    if not new_rows:
+        print("No new backfill headlines found.")
+        return 0
+
+    new_df = pd.DataFrame(new_rows)
+    RAW_NEWS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if RAW_NEWS_FILE.exists():
+        combined_df = pd.concat([pd.read_csv(RAW_NEWS_FILE), new_df], ignore_index=True)
+        combined_df = combined_df.drop_duplicates(subset=["headline"], keep="last")
+    else:
+        combined_df = new_df
+
+    for column in existing_columns:
+        if column not in combined_df.columns:
+            combined_df[column] = ""
+    combined_df = combined_df.sort_values("timestamp", ascending=False)
+    combined_df.to_csv(RAW_NEWS_FILE, index=False)
+
+    print(f"Backfill complete. Added {len(new_df)} headlines to {RAW_NEWS_FILE}")
+    return len(new_df)
 
 
 def run(model: str = "llama3.1") -> None:
@@ -129,5 +234,15 @@ def run(model: str = "llama3.1") -> None:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="News librarian utilities.")
+    parser.add_argument("--mode", choices=["process", "backfill"], default="process")
+    parser.add_argument("--model", default="llama3.1")
+    parser.add_argument("--ticker", help="Ticker symbol for backfill mode.")
+    parser.add_argument("--days", type=int, default=365)
+    args = parser.parse_args()
+
+    if args.mode == "backfill":
+        backfill_ticker_news(args.ticker or "", days=args.days)
+    else:
+        run(model=args.model)
 

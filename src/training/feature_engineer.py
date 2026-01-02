@@ -11,6 +11,14 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     ta = None
 
+SENTIMENT_WINDOWS = {
+    "1h": "1h",
+    "1d": "1d",
+    "1w": "7d",
+    "1m": "30d",
+}
+REGIONS = ["GLOBAL", "US", "TICKER"]
+
 
 @dataclass
 class FeatureEngineerConfig:
@@ -47,10 +55,8 @@ class FeatureEngineer:
 
     def add_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         df = self._ensure_close(data)
-        # 1. EMA
         df["ema"] = df["close"].ewm(span=self.config.ema_length, adjust=False).mean()
 
-        # 2. RSI
         if ta is not None:
             df["rsi"] = ta.rsi(df["close"], length=self.config.rsi_length)
         else:
@@ -64,78 +70,49 @@ class FeatureEngineer:
 
         return df
 
-    def add_sentiment_score(
+    def _load_sentiment(self, sentiment_file: Union[str, Path, None]) -> pd.DataFrame | None:
+        if sentiment_file is None or not Path(sentiment_file).exists():
+            return None
+
+        sent_df = pd.read_csv(sentiment_file)
+        return _normalize_sentiment_frame(sent_df)
+
+    def add_sentiment_features(
         self,
         data: pd.DataFrame,
         sentiment_file: Union[str, Path, None] = None,
     ) -> pd.DataFrame:
-        """
-        Merges AI sentiment scores into the market data.
-        Logic: fill forward - the last known news score applies until new news arrives.
-        """
         df = self._ensure_timestamp(data)
+        sent_df = self._load_sentiment(sentiment_file)
 
-        # 1. If no file provided, use default (Neutral)
-        if sentiment_file is None or not Path(sentiment_file).exists():
-            print("WARNING: No sentiment file found. Using default neutral sentiment.")
-            df["sentiment_score"] = float(self.config.sentiment_default)
+        sentiment_columns = [
+            f"sent_{region.lower()}_{window}"
+            for region in REGIONS
+            for window in SENTIMENT_WINDOWS
+        ]
+
+        if sent_df is None or sent_df.empty:
+            for column in sentiment_columns:
+                df[column] = float(self.config.sentiment_default)
             return df
 
-        # 2. Load the AI Scores
-        try:
-            sent_df = pd.read_csv(sentiment_file)
-            date_col = None
-            if "date" in sent_df.columns:
-                date_col = "date"
-            elif "timestamp" in sent_df.columns:
-                date_col = "timestamp"
-            elif "Date" in sent_df.columns:
-                date_col = "Date"
+        sentiment_features = _build_sentiment_feature_frame(sent_df)
 
-            sentiment_col = None
-            if "ai_sentiment" in sent_df.columns:
-                sentiment_col = "ai_sentiment"
-            elif "sentiment" in sent_df.columns:
-                sentiment_col = "sentiment"
+        df = df.sort_values("timestamp")
+        merged = pd.merge_asof(
+            df,
+            sentiment_features,
+            left_on="timestamp",
+            right_index=True,
+            direction="backward",
+        )
 
-            if not date_col or not sentiment_col:
-                print("WARNING: Sentiment file missing date or sentiment columns.")
-                df["sentiment_score"] = float(self.config.sentiment_default)
-                return df
-
-            # Convert to datetime and sort
-            sent_df["timestamp"] = pd.to_datetime(sent_df[date_col], utc=True, errors="coerce")
-            sent_df[sentiment_col] = pd.to_numeric(sent_df[sentiment_col], errors="coerce")
-            sent_df = sent_df.dropna(subset=["timestamp"])
-            sent_df = sent_df.sort_values("timestamp")
-
-            # Keep only relevant columns
-            sent_df = sent_df[["timestamp", sentiment_col]]
-
-            # 3. Merge with Market Data (As-Of Merge)
-            df = df.sort_values("timestamp")
-
-            merged = pd.merge_asof(
-                df,
-                sent_df,
-                on="timestamp",
-                direction="backward",
-            )
-
-            # Rename and fill missing (before first news) with default
-            merged = merged.rename(columns={sentiment_col: "sentiment_score"})
-            merged["sentiment_score"] = merged["sentiment_score"].fillna(self.config.sentiment_default)
-
-            return merged
-
-        except Exception as exc:
-            print(f"ERROR: Error merging sentiment: {exc}")
-            df["sentiment_score"] = float(self.config.sentiment_default)
-            return df
+        merged[sentiment_columns] = merged[sentiment_columns].ffill().fillna(self.config.sentiment_default)
+        return merged
 
     def transform(self, data: pd.DataFrame, sentiment_file: Union[str, Path, None] = None) -> pd.DataFrame:
         df = self.add_indicators(data)
-        df = self.add_sentiment_score(df, sentiment_file)
+        df = self.add_sentiment_features(df, sentiment_file)
         return df
 
 
@@ -146,3 +123,98 @@ def engineer_features(
 ) -> pd.DataFrame:
     config = FeatureEngineerConfig(sentiment_default=default_sentiment)
     return FeatureEngineer(config).transform(price_df, sentiment_file)
+
+
+def get_sentiment_feature_columns() -> list[str]:
+    return [f"sent_{region.lower()}_{window}" for region in REGIONS for window in SENTIMENT_WINDOWS]
+
+
+def _normalize_sentiment_frame(sent_df: pd.DataFrame) -> pd.DataFrame | None:
+    if sent_df.empty:
+        return None
+
+    date_col = None
+    if "timestamp" in sent_df.columns:
+        date_col = "timestamp"
+    elif "date" in sent_df.columns:
+        date_col = "date"
+    elif "published" in sent_df.columns:
+        date_col = "published"
+
+    if date_col is None or "sentiment" not in sent_df.columns:
+        return None
+
+    region_col = "region" if "region" in sent_df.columns else None
+
+    sent_df = sent_df.copy()
+    sent_df["timestamp"] = pd.to_datetime(sent_df[date_col], utc=True, errors="coerce")
+    sent_df["sentiment"] = pd.to_numeric(sent_df["sentiment"], errors="coerce")
+    sent_df = sent_df.dropna(subset=["timestamp", "sentiment"])
+    if region_col is None:
+        sent_df["region"] = "US"
+    else:
+        sent_df["region"] = sent_df[region_col].fillna("US").astype(str).str.upper()
+
+    return sent_df[["timestamp", "region", "sentiment"]].sort_values("timestamp")
+
+
+def _build_sentiment_feature_frame(sent_df: pd.DataFrame) -> pd.DataFrame:
+    region_frames = []
+    for region in REGIONS:
+        region_df = sent_df[sent_df["region"] == region].copy()
+        if region_df.empty:
+            region_frames.append(
+                pd.DataFrame(
+                    columns=[f"sent_{region.lower()}_{window}" for window in SENTIMENT_WINDOWS],
+                    index=pd.DatetimeIndex([], name="timestamp"),
+                )
+            )
+            continue
+
+        region_df = region_df.set_index("timestamp").sort_index()
+        rolling_data: dict[str, pd.Series] = {}
+        for window_key, window in SENTIMENT_WINDOWS.items():
+            rolling_data[f"sent_{region.lower()}_{window_key}"] = region_df["sentiment"].rolling(
+                window,
+                min_periods=1,
+            ).mean()
+        region_frames.append(pd.DataFrame(rolling_data))
+
+    return pd.concat(region_frames, axis=1).sort_index()
+
+
+def generate_rolling_features(
+    sentiment_df: pd.DataFrame,
+    asof_timestamp: pd.Timestamp,
+    default_sentiment: float = 0.0,
+) -> dict[str, float]:
+    sentiment_columns = get_sentiment_feature_columns()
+    if sentiment_df is None or sentiment_df.empty:
+        return {column: float(default_sentiment) for column in sentiment_columns}
+
+    normalized = _normalize_sentiment_frame(sentiment_df)
+    if normalized is None or normalized.empty:
+        return {column: float(default_sentiment) for column in sentiment_columns}
+
+    sentiment_features = _build_sentiment_feature_frame(normalized)
+    target_df = pd.DataFrame(
+        {"timestamp": [pd.to_datetime(asof_timestamp, utc=True, errors="coerce")]},
+    ).dropna(subset=["timestamp"])
+
+    if target_df.empty:
+        return {column: float(default_sentiment) for column in sentiment_columns}
+
+    merged = pd.merge_asof(
+        target_df.sort_values("timestamp"),
+        sentiment_features,
+        left_on="timestamp",
+        right_index=True,
+        direction="backward",
+    )
+
+    for column in sentiment_columns:
+        if column not in merged.columns:
+            merged[column] = float(default_sentiment)
+    merged[sentiment_columns] = merged[sentiment_columns].ffill().fillna(default_sentiment)
+
+    return {column: float(merged.iloc[0][column]) for column in sentiment_columns}
