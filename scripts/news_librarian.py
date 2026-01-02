@@ -4,6 +4,7 @@ import argparse
 import json
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 import feedparser
 import ollama
@@ -128,8 +129,9 @@ def backfill_ticker_news(ticker: str, days: int = 365) -> int:
                 existing_keys.add(key)
 
     query = f"{ticker} stock when:{days}d"
+    encoded_query = quote(query)
     feed_urls = [
-        f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+        f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en",
     ]
 
     new_rows = []
