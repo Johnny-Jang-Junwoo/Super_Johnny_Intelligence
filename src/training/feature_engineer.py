@@ -131,15 +131,15 @@ class FeatureEngineer:
         df = self._ensure_timestamp(data)
         sent_df = self._load_sentiment(sentiment_file)
 
-        sentiment_columns = [
+        regional_columns = [
             f"sent_{region.lower()}_{window}"
             for region in REGIONS
             for window in SENTIMENT_WINDOWS
         ]
-        sentiment_columns += AGG_SENTIMENT_COLUMNS
+        all_sentiment_columns = regional_columns + AGG_SENTIMENT_COLUMNS
 
         if sent_df is None or sent_df.empty:
-            for column in sentiment_columns:
+            for column in all_sentiment_columns:
                 df[column] = float(self.config.sentiment_default)
             return df
 
@@ -154,7 +154,11 @@ class FeatureEngineer:
             direction="backward",
         )
 
-        merged[sentiment_columns] = merged[sentiment_columns].ffill().fillna(self.config.sentiment_default)
+        # Fill regional columns first, then compute aggregates
+        for col in regional_columns:
+            if col not in merged.columns:
+                merged[col] = float(self.config.sentiment_default)
+        merged[regional_columns] = merged[regional_columns].ffill().fillna(self.config.sentiment_default)
         _add_aggregate_sentiment(merged, self.config.sentiment_default)
         return merged
 
@@ -214,7 +218,7 @@ def _build_sentiment_feature_frame(sent_df: pd.DataFrame) -> pd.DataFrame:
             region_frames.append(
                 pd.DataFrame(
                     columns=[f"sent_{region.lower()}_{window}" for window in SENTIMENT_WINDOWS],
-                    index=pd.DatetimeIndex([], name="timestamp"),
+                    index=pd.DatetimeIndex([], name="timestamp", tz="UTC"),
                 )
             )
             continue
