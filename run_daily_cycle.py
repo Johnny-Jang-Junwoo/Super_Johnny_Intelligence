@@ -76,6 +76,38 @@ def _format_move(value: float | None) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _conviction_label(value: float | None) -> str:
+    if value is None:
+        return "No Signal"
+    magnitude = abs(value)
+    if magnitude >= 0.01:
+        return "High Conviction"
+    if magnitude >= 0.005:
+        return "Medium Conviction"
+    return "Low Conviction"
+
+
+def _direction_label(value: float | None, positive: str, negative: str, neutral: str = "Neutral") -> str:
+    if value is None:
+        return "No Signal"
+    if value > 0:
+        return positive
+    if value < 0:
+        return negative
+    return neutral
+
+
+def _top_sentiment_feature(report: ai_model.TrainingReport) -> tuple[str, float] | None:
+    if report.feature_importance.empty:
+        return None
+    sent_mask = report.feature_importance["feature"].astype(str).str.startswith("sent_")
+    sent_df = report.feature_importance[sent_mask]
+    if sent_df.empty:
+        return None
+    top_row = sent_df.iloc[0]
+    return str(top_row["feature"]), float(top_row["importance"])
+
+
 def _sentiment_alignment(features_df: pd.DataFrame) -> tuple[int, str, float | None, float | None]:
     if features_df.empty:
         return 50, "Unknown", None, None
@@ -188,6 +220,10 @@ def main() -> None:
         )
         for report in reports.values():
             print(f"Model trained ({report.horizon}): {report.model_path} (MAE {report.mae:.4f})")
+            top_sent = _top_sentiment_feature(report)
+            if top_sent:
+                feature, importance = top_sent
+                print(f"Top sentiment feature ({report.horizon}): {feature} ({importance:.3f})")
     except Exception as exc:
         print(f"Training failed ({exc}); attempting to load latest models.")
         try:
@@ -209,8 +245,6 @@ def main() -> None:
     summary = (
         f"Market Mood: {mood} ({sentiment_score:.2f}). "
         f"AI Recommendation: {recommendation}. "
-        f"Predicted Movement: 1d {_format_move(pred_1d)}, "
-        f"1w {_format_move(pred_1w)}, 1m {_format_move(pred_1m)}. "
         f"Strategy Alignment: {alignment_label} ({alignment_score}/100)."
     )
     if sector:
@@ -218,6 +252,18 @@ def main() -> None:
     if short_mean is not None and long_mean is not None:
         summary += f" Short Sent: {short_mean:.2f}, Long Sent: {long_mean:.2f}."
     print(summary)
+
+    print(
+        f"Short-term (1D) Prediction: {_format_move(pred_1d)} ({_conviction_label(pred_1d)})."
+    )
+    print(
+        f"Mid-term (1W) Prediction: {_format_move(pred_1w)} "
+        f"({_direction_label(pred_1w, 'Macro Push', 'Macro Drag')})."
+    )
+    print(
+        f"Long-term (1M) Prediction: {_format_move(pred_1m)} "
+        f"({_direction_label(pred_1m, 'Macro Tailwind', 'Macro Headwind')})."
+    )
 
 
 if __name__ == "__main__":

@@ -20,9 +20,9 @@ HORIZON_PERIODS = {
     "1m": 21,
 }
 TARGET_COLUMNS = {
-    "1d": "target_next_1d_change",
-    "1w": "target_next_1w_change",
-    "1m": "target_next_1m_change",
+    "1d": "target_1d_change",
+    "1w": "target_1w_change",
+    "1m": "target_1m_change",
 }
 
 
@@ -205,6 +205,24 @@ def train_and_predict(
     save_feature_importance_report(reports.values(), model_dir)
 
     return predictions, reports, training_df
+
+
+def execute_rolling_study(
+    price_df: pd.DataFrame,
+    sentiment_file: Path | str | None = None,
+    default_sentiment: float = 0.0,
+    model_dir: Path | None = None,
+    min_train_days: int = 60,
+    n_estimators: int = 200,
+) -> pd.DataFrame:
+    return daily_walk_forward_train(
+        price_df=price_df,
+        sentiment_file=sentiment_file,
+        default_sentiment=default_sentiment,
+        model_dir=model_dir,
+        min_train_days=min_train_days,
+        n_estimators=n_estimators,
+    )
 
 
 def daily_walk_forward_train(

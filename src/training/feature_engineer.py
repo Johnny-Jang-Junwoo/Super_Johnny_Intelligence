@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pandas as pd
+import re
 
 try:
     import pandas_ta as ta
@@ -18,6 +19,26 @@ SENTIMENT_WINDOWS = {
     "1m": "30d",
 }
 REGIONS = ["GLOBAL", "US", "TICKER"]
+AGG_SENTIMENT_COLUMNS = [f"sent_{window}_avg" for window in SENTIMENT_WINDOWS]
+
+TICKER_PATTERN = re.compile(r"\$(?P<ticker>[A-Z]{1,5})\b")
+EXCHANGE_PATTERN = re.compile(r"\b(?:NYSE|NASDAQ):\s*[A-Z]{1,5}\b")
+GLOBAL_SOURCE_KEYWORDS = {
+    "coindesk",
+    "cointelegraph",
+    "bitcoinmagazine",
+    "theblock",
+    "dailyfx",
+    "investing.com",
+    "reuters",
+    "bloomberg",
+}
+CATEGORY_REGION = {
+    "CRYPTO": "GLOBAL",
+    "FOREX": "GLOBAL",
+    "COMMODITIES": "GLOBAL",
+    "TICKER": "TICKER",
+}
 
 
 @dataclass
@@ -90,6 +111,7 @@ class FeatureEngineer:
             for region in REGIONS
             for window in SENTIMENT_WINDOWS
         ]
+        sentiment_columns += AGG_SENTIMENT_COLUMNS
 
         if sent_df is None or sent_df.empty:
             for column in sentiment_columns:
@@ -108,6 +130,7 @@ class FeatureEngineer:
         )
 
         merged[sentiment_columns] = merged[sentiment_columns].ffill().fillna(self.config.sentiment_default)
+        _add_aggregate_sentiment(merged, self.config.sentiment_default)
         return merged
 
     def transform(self, data: pd.DataFrame, sentiment_file: Union[str, Path, None] = None) -> pd.DataFrame:
@@ -126,7 +149,8 @@ def engineer_features(
 
 
 def get_sentiment_feature_columns() -> list[str]:
-    return [f"sent_{region.lower()}_{window}" for region in REGIONS for window in SENTIMENT_WINDOWS]
+    regional = [f"sent_{region.lower()}_{window}" for region in REGIONS for window in SENTIMENT_WINDOWS]
+    return regional + AGG_SENTIMENT_COLUMNS
 
 
 def _normalize_sentiment_frame(sent_df: pd.DataFrame) -> pd.DataFrame | None:
@@ -144,16 +168,15 @@ def _normalize_sentiment_frame(sent_df: pd.DataFrame) -> pd.DataFrame | None:
     if date_col is None or "sentiment" not in sent_df.columns:
         return None
 
-    region_col = "region" if "region" in sent_df.columns else None
-
     sent_df = sent_df.copy()
     sent_df["timestamp"] = pd.to_datetime(sent_df[date_col], utc=True, errors="coerce")
     sent_df["sentiment"] = pd.to_numeric(sent_df["sentiment"], errors="coerce")
     sent_df = sent_df.dropna(subset=["timestamp", "sentiment"])
-    if region_col is None:
-        sent_df["region"] = "US"
+
+    if "region" in sent_df.columns:
+        sent_df["region"] = sent_df["region"].fillna("US").astype(str).str.upper()
     else:
-        sent_df["region"] = sent_df[region_col].fillna("US").astype(str).str.upper()
+        sent_df["region"] = sent_df.apply(_infer_region_from_metadata, axis=1)
 
     return sent_df[["timestamp", "region", "sentiment"]].sort_values("timestamp")
 
@@ -181,6 +204,33 @@ def _build_sentiment_feature_frame(sent_df: pd.DataFrame) -> pd.DataFrame:
         region_frames.append(pd.DataFrame(rolling_data))
 
     return pd.concat(region_frames, axis=1).sort_index()
+
+
+def _infer_region_from_metadata(row: pd.Series) -> str:
+    headline = str(row.get("headline", "")).strip()
+    category = str(row.get("category", "")).upper()
+    source = str(row.get("source", "")).lower()
+
+    if TICKER_PATTERN.search(headline) or EXCHANGE_PATTERN.search(headline):
+        return "TICKER"
+
+    for key, region in CATEGORY_REGION.items():
+        if key in category:
+            return region
+
+    if any(keyword in source for keyword in GLOBAL_SOURCE_KEYWORDS):
+        return "GLOBAL"
+
+    return "US"
+
+
+def _add_aggregate_sentiment(df: pd.DataFrame, default_sentiment: float) -> None:
+    for window in SENTIMENT_WINDOWS:
+        columns = [f"sent_{region.lower()}_{window}" for region in REGIONS if f"sent_{region.lower()}_{window}" in df]
+        if not columns:
+            df[f"sent_{window}_avg"] = float(default_sentiment)
+            continue
+        df[f"sent_{window}_avg"] = df[columns].mean(axis=1).fillna(default_sentiment)
 
 
 def generate_rolling_features(
@@ -216,5 +266,6 @@ def generate_rolling_features(
         if column not in merged.columns:
             merged[column] = float(default_sentiment)
     merged[sentiment_columns] = merged[sentiment_columns].ffill().fillna(default_sentiment)
+    _add_aggregate_sentiment(merged, default_sentiment)
 
     return {column: float(merged.iloc[0][column]) for column in sentiment_columns}

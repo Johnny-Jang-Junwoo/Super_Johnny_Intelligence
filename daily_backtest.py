@@ -35,7 +35,7 @@ def main() -> None:
     sentiment_path = sentiment_file if sentiment_file.exists() else None
 
     price_df = market_loader.fetch_market_data(ticker, interval=args.interval)
-    report_df = ai_model.daily_walk_forward_train(
+    report_df = ai_model.execute_rolling_study(
         price_df=price_df,
         sentiment_file=sentiment_path,
         default_sentiment=0.0,
